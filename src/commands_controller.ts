@@ -56,7 +56,15 @@ export class CommandsController implements Disposable, NeovimExtensionRequestPro
             }
             case "cursor-move": {
                 const [to, by] = args as [
-                    "wrappedLineFirstNonWhitespaceCharacter" | "wrappedLineLastNonWhitespaceCharacter",
+                    (
+                        | "wrappedLineStart"
+                        | "wrappedLineEnd"
+                        | "wrappedLineFirstNonWhitespaceCharacter"
+                        | "wrappedLineLastNonWhitespaceCharacter"
+                        | "viewPortTop"
+                        | "viewPortCenter"
+                        | "viewPortBottom"
+                    ),
                     "line" | "wrappedLine" | "character" | "halfLine",
                 ];
                 this.cursorMove(to, by);
@@ -147,7 +155,14 @@ export class CommandsController implements Disposable, NeovimExtensionRequestPro
     };
 
     private cursorMove = (
-        to: "wrappedLineFirstNonWhitespaceCharacter" | "wrappedLineLastNonWhitespaceCharacter",
+        to:
+            | "wrappedLineStart"
+            | "wrappedLineEnd"
+            | "wrappedLineFirstNonWhitespaceCharacter"
+            | "wrappedLineLastNonWhitespaceCharacter"
+            | "viewPortTop"
+            | "viewPortCenter"
+            | "viewPortBottom",
         by: "line" | "wrappedLine" | "character" | "halfLine",
     ): void => {
         vscode.commands.executeCommand("cursorMove", { to: to, by: by, value: 1, select: false });

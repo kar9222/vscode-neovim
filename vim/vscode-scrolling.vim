@@ -15,12 +15,26 @@ xnoremap z- <Cmd>call <SID>reveal('bottom', 1)<CR>
 nnoremap zb <Cmd>call <SID>reveal('bottom', 0)<CR>
 xnoremap zb <Cmd>call <SID>reveal('bottom', 0)<CR>
 
-nnoremap <expr> H VSCodeExtensionNotify('move-cursor', 'top')
-xnoremap <expr> H VSCodeExtensionNotify('move-cursor', 'top')
-nnoremap <expr> M VSCodeExtensionNotify('move-cursor', 'middle')
-xnoremap <expr> M VSCodeExtensionNotify('move-cursor', 'middle')
-nnoremap <expr> L VSCodeExtensionNotify('move-cursor', 'bottom')
-xnoremap <expr> L VSCodeExtensionNotify('move-cursor', 'bottom')
+
+function s:cursorMove(to)
+    let to = a:to
+    normal! m'
+    call VSCodeExtensionNotify('cursor-move', to)
+endfunction
+
+nnoremap H <Cmd>call <SID>cursorMove('viewPortTop')<CR>
+xnoremap H <Cmd>call <SID>cursorMove('viewPortTop')<CR>
+nnoremap M <Cmd>call <SID>cursorMove('viewPortCenter')<CR>
+xnoremap M <Cmd>call <SID>cursorMove('viewPortCenter')<CR>
+nnoremap L <Cmd>call <SID>cursorMove('viewPortBottom')<CR>
+xnoremap L <Cmd>call <SID>cursorMove('viewPortBottom')<CR>
+
+" nnoremap <expr> H VSCodeExtensionNotify('move-cursor', 'top')
+" xnoremap <expr> H VSCodeExtensionNotify('move-cursor', 'top')
+" nnoremap <expr> M VSCodeExtensionNotify('move-cursor', 'middle')
+" xnoremap <expr> M VSCodeExtensionNotify('move-cursor', 'middle')
+" nnoremap <expr> L VSCodeExtensionNotify('move-cursor', 'bottom')
+" xnoremap <expr> L VSCodeExtensionNotify('move-cursor', 'bottom')
 
 " Disabled due to scroll problems (the ext binds them directly)
 " nnoremap <silent> <expr> <C-d> VSCodeExtensionCall('scroll', 'halfPage', 'down')

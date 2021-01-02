@@ -1,5 +1,42 @@
 # Change Log
 
+## [0.0.75]
+
+-   Improvements to cursor logic ( #501 )
+-   Cancel current mode when switching editor ( #156 )
+
+## [0.0.74]
+
+-   Fix cursor logic ( #467 , #488 )
+-   Trigger matching word highlight after movement ( #159 )
+-   VIM highlight adjustments ( #482 )
+
+## [0.0.73]
+
+-   Improve cursor reveailing logic ( #479 )
+-   Hook g0 / g\$ ( #455 )
+
+## [0.0.72]
+
+-   Fix undo regression introduced in `0.0.70`
+
+## [0.0.71]
+
+-   Fix `Unable to determine neovim windows id` error spam ( #418 )
+
+## [0.0.70]
+
+-   Use vscode jumplist actions instead of neovim
+-   Fix uppercase marks ( #228 )
+-   Various cursor & buffer management fixes ( #404 , #392 , #386 )
+-   Implement manageEditorHeight and manageEditorWidth ( #444 )
+-   Fix `<C-a>` in insert mode ( #283 )
+-   Set vim cwd as vscode workspace ( #429 )
+-   Fix shell-agnostic WSL integration ( #147 )
+-   Map :x to Wq ( #396 )
+-   Various docs contributions
+-   Improve build ( #378 )
+
 ## [0.0.63]
 
 -   Allow to put text decorations (usually EasyMotion ones) at top setting (`vscode-neovim.textDecorationsAtTop`) ( #358 ), contributed by @jhgarner

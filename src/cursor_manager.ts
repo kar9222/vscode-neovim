@@ -3,7 +3,6 @@ import { NeovimClient, Window } from "neovim";
 import {
     commands,
     Disposable,
-    Range,
     Selection,
     TextEditor,
     TextEditorCursorStyle,
@@ -56,6 +55,12 @@ export class CursorManager
      * Special workaround flag to ignore editor selection events
      */
     private ignoreSelectionEvents = false;
+    /**
+     * Current grid viewport boundaries
+     */
+    private gridVisibleViewport: Map<number, { top: number; bottom: number }> = new Map();
+
+    private debouncedCursorUpdates: WeakMap<TextEditor, CursorManager["updateCursorPosInEditor"]> = new WeakMap();
 
     public constructor(
         private logger: Logger,
@@ -67,6 +72,7 @@ export class CursorManager
     ) {
         this.disposables.push(window.onDidChangeTextEditorSelection(this.onSelectionChanged));
         this.disposables.push(window.onDidChangeVisibleTextEditors(this.onDidChangeVisibleTextEditors));
+        this.modeManager.onModeChange(this.onModeChange);
     }
     public dispose(): void {
         this.disposables.forEach((d) => d.dispose());
@@ -91,9 +97,13 @@ export class CursorManager
     }
 
     public handleRedrawBatch(batch: [string, ...unknown[]][]): void {
-        const winCursorsUpdates: Map<number, { line: number; col: number }> = new Map();
+        const gridCursorUpdates: Map<
+            number,
+            { line: number; col: number; grid: number; isScreenCol: boolean }
+        > = new Map();
+        const gridCursorViewportHint: Map<number, { line: number; col: number }> = new Map();
+        // need to process win_viewport events first
         for (const [name, ...args] of batch) {
-            const firstArg = args[0] || [];
             switch (name) {
                 case "win_viewport": {
                     // eslint-disable-next-line @typescript-eslint/no-unused-vars
@@ -105,7 +115,63 @@ export class CursorManager
                         number,
                         number,
                     ][]) {
-                        winCursorsUpdates.set(win.id, { line: curline, col: curcol });
+                        this.gridVisibleViewport.set(grid, { top: topline, bottom: botline });
+                        gridCursorViewportHint.set(grid, { line: curline, col: curcol });
+                    }
+                    break;
+                }
+            }
+        }
+        for (const [name, ...args] of batch) {
+            const firstArg = args[0] || [];
+            switch (name) {
+                case "grid_cursor_goto": {
+                    for (const [grid, row, col] of args as [number, number, number][]) {
+                        const viewportHint = gridCursorViewportHint.get(grid);
+                        // leverage viewport hint if available. It may be NOT available and go in different batch
+                        if (viewportHint) {
+                            gridCursorUpdates.set(grid, {
+                                grid,
+                                line: viewportHint.line,
+                                col: viewportHint.col,
+                                isScreenCol: true,
+                            });
+                        } else {
+                            const topline = this.gridVisibleViewport.get(grid)?.top || 0;
+                            gridCursorUpdates.set(grid, { grid, line: topline + row, col, isScreenCol: false });
+                        }
+                    }
+                    break;
+                }
+                // nvim may not send grid_cursor_goto and instead uses grid_scroll along with grid_line
+                // If we received it we must shift current cursor position by given rows
+                case "grid_scroll": {
+                    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+                    for (const [grid, top, bot, left, right, rows, cols] of args as [
+                        number,
+                        number,
+                        number,
+                        null,
+                        number,
+                        number,
+                        number,
+                    ][]) {
+                        // When changing pos via grid scroll there must be always win_viewport event, leverage it
+                        const viewportHint = gridCursorViewportHint.get(grid);
+                        if (viewportHint) {
+                            gridCursorUpdates.set(grid, {
+                                grid,
+                                line: viewportHint.line,
+                                col: viewportHint.col,
+                                isScreenCol: true,
+                            });
+                        }
+                    }
+                    break;
+                }
+                case "grid_destroy": {
+                    for (const [grid] of args as [number][]) {
+                        this.gridVisibleViewport.delete(grid);
                     }
                     break;
                 }
@@ -129,13 +195,13 @@ export class CursorManager
                 }
             }
         }
-        for (const [winId, cursorPos] of winCursorsUpdates) {
+        for (const [gridId, cursorPos] of gridCursorUpdates) {
             this.logger.debug(
-                `${LOG_PREFIX}: Received cursor update from neovim, winId: ${winId}, pos: [${cursorPos.line}, ${cursorPos.col}]`,
+                `${LOG_PREFIX}: Received cursor update from neovim, gridId: ${gridId}, pos: [${cursorPos.line}, ${cursorPos.col}]`,
             );
-            const editor = this.bufferManager.getEditorFromWinId(winId);
+            const editor = this.bufferManager.getEditorFromGridId(gridId);
             if (!editor) {
-                this.logger.warn(`${LOG_PREFIX}: No editor for winId: ${winId}`);
+                this.logger.warn(`${LOG_PREFIX}: No editor for gridId: ${gridId}`);
                 continue;
             }
             // !For text changes neovim sends first buf_lines_event followed by redraw event
@@ -143,34 +209,40 @@ export class CursorManager
             const docPromises = this.changeManager.getDocumentChangeCompletionLock(editor.document);
             if (docPromises) {
                 this.logger.debug(
-                    `${LOG_PREFIX}: Waiting for document change completion before setting the cursor, winId: ${winId}`,
+                    `${LOG_PREFIX}: Waiting for document change completion before setting the cursor, gridId: ${gridId}`,
                 );
                 docPromises.then(() => {
                     try {
-                        this.logger.debug(`${LOG_PREFIX}: Waiting document change completion done, winId: ${winId}`);
-                        const finalCol = calculateEditorColFromVimScreenCol(
-                            editor.document.lineAt(cursorPos.line).text,
-                            cursorPos.col,
-                            // !For cursor updates tab is always counted as 1 col
-                            1,
-                            true,
-                        );
+                        this.logger.debug(`${LOG_PREFIX}: Waiting document change completion done, gridId: ${gridId}`);
+                        const finalCol = cursorPos.isScreenCol
+                            ? calculateEditorColFromVimScreenCol(
+                                  editor.document.lineAt(cursorPos.line).text,
+                                  cursorPos.col,
+                                  // !For cursor updates tab is always counted as 1 col
+                                  1,
+                                  true,
+                              )
+                            : cursorPos.col;
                         this.neovimCursorPosition.set(editor, { line: cursorPos.line, col: finalCol });
-                        this.updateCursorPosInEditor(editor, cursorPos.line, finalCol);
+                        // !Often, especially with complex multi-command operations, neovim sends multiple cursor updates in multiple batches
+                        // !To not mess the cursor, try to debounce the update
+                        this.getDebouncedUpdateCursorPos(editor)(editor, cursorPos.line, finalCol);
                     } catch (e) {
                         this.logger.warn(`${LOG_PREFIX}: ${e.message}`);
                     }
                 });
             } else {
                 // !Sync call helps with most common operations latency
-                this.logger.debug(`${LOG_PREFIX}: No pending document changes, winId: ${winId}`);
+                this.logger.debug(`${LOG_PREFIX}: No pending document changes, gridId: ${gridId}`);
                 try {
-                    const finalCol = calculateEditorColFromVimScreenCol(
-                        editor.document.lineAt(cursorPos.line).text,
-                        cursorPos.col,
-                        1,
-                        true,
-                    );
+                    const finalCol = cursorPos.isScreenCol
+                        ? calculateEditorColFromVimScreenCol(
+                              editor.document.lineAt(cursorPos.line).text,
+                              cursorPos.col,
+                              1,
+                              true,
+                          )
+                        : cursorPos.col;
                     this.neovimCursorPosition.set(editor, { line: cursorPos.line, col: finalCol });
                     this.updateCursorPosInEditor(editor, cursorPos.line, finalCol);
                 } catch (e) {
@@ -178,7 +250,7 @@ export class CursorManager
                 }
             }
         }
-        winCursorsUpdates.clear();
+        gridCursorUpdates.clear();
     }
 
     /**
@@ -254,40 +326,54 @@ export class CursorManager
         this.updateCursorStyle(this.modeManager.currentMode);
     };
 
+    private onSelectionChanged = async (e: TextEditorSelectionChangeEvent): Promise<void> => {
+        if (this.modeManager.isInsertMode) {
+            return;
+        }
+        if (this.ignoreSelectionEvents) {
+            return;
+        }
+        const { textEditor, kind } = e;
+        this.logger.debug(`${LOG_PREFIX}: SelectionChanged`);
+
+        // ! Note: Unfortunately navigating from outline is Command kind, so we can't skip it :(
+        // if (kind === TextEditorSelectionChangeKind.Command) {
+        //     this.logger.debug(`${LOG_PREFIX}: Skipping command kind`);
+        //     return;
+        // }
+
+        // wait for possible layout updates first
+        this.logger.debug(`${LOG_PREFIX}: Waiting for possible layout completion operation`);
+        await this.bufferManager.waitForLayoutSync();
+        // wait for possible change document events
+        this.logger.debug(`${LOG_PREFIX}: Waiting for possible document change completion operation`);
+        await this.changeManager.getDocumentChangeCompletionLock(textEditor.document);
+        this.logger.debug(`${LOG_PREFIX}: Waiting done`);
+
+        const documentChange = this.changeManager.eatDocumentCursorAfterChange(textEditor.document);
+        const cursor = textEditor.selection.active;
+        if (documentChange && documentChange.line === cursor.line && documentChange.character === cursor.character) {
+            this.logger.debug(
+                `${LOG_PREFIX}: Skipping onSelectionChanged event since it was selection produced by doc change`,
+            );
+            return;
+        }
+
+        this.applySelectionChanged(textEditor, kind);
+    };
+
     // ! Need to debounce requests because setting cursor by consequence of neovim event will trigger this method
     // ! and cursor may go out-of-sync and produce a jitter
-    private onSelectionChanged = debounce(
-        async (e: TextEditorSelectionChangeEvent): Promise<void> => {
-            if (this.modeManager.isInsertMode) {
-                return;
-            }
-            if (this.ignoreSelectionEvents) {
-                return;
-            }
-            const { textEditor, kind, selections } = e;
-            this.logger.debug(`${LOG_PREFIX}: SelectionChanged`);
-
-            // ! Note: Unfortunately navigating from outline is Command kind, so we can't skip it :(
-            // if (kind === TextEditorSelectionChangeKind.Command) {
-            //     this.logger.debug(`${LOG_PREFIX}: Skipping command kind`);
-            //     return;
-            // }
-
-            // wait for possible layout updates first
-            this.logger.debug(`${LOG_PREFIX}: Waiting for possible layout completion operation`);
-            await this.bufferManager.waitForLayoutSync();
-            // wait for possible change document events
-            this.logger.debug(`${LOG_PREFIX}: Waiting for possible document change completion operation`);
-            await this.changeManager.getDocumentChangeCompletionLock(textEditor.document);
-            this.logger.debug(`${LOG_PREFIX}: Waiting done`);
-
+    private applySelectionChanged = debounce(
+        async (textEditor: TextEditor, kind: TextEditorSelectionChangeKind | undefined) => {
             const winId = this.bufferManager.getWinIdForTextEditor(textEditor);
-            const cursor = selections[0].active;
+            const cursor = textEditor.selection.active;
+            const selections = textEditor.selections;
 
             this.logger.debug(
-                `${LOG_PREFIX}: kind: ${kind}, WinId: ${winId}, cursor: [${cursor.line}, ${
+                `${LOG_PREFIX}: Applying changed selection, kind: ${kind}, WinId: ${winId}, cursor: [${cursor.line}, ${
                     cursor.character
-                }], isMultiSelection: ${selections.length > 1}`,
+                }], isMultiSelection: ${textEditor.selections.length > 1}`,
             );
             if (!winId) {
                 return;
@@ -299,12 +385,11 @@ export class CursorManager
             }
 
             if (
-                e.selections.length > 1 ||
-                (e.kind === TextEditorSelectionChangeKind.Mouse &&
-                    !e.selections[0].active.isEqual(e.selections[0].anchor)) ||
+                selections.length > 1 ||
+                (kind === TextEditorSelectionChangeKind.Mouse && !selections[0].active.isEqual(selections[0].anchor)) ||
                 this.modeManager.isVisualMode
             ) {
-                if (e.kind !== TextEditorSelectionChangeKind.Mouse || !this.settings.mouseSelectionEnabled) {
+                if (kind !== TextEditorSelectionChangeKind.Mouse || !this.settings.mouseSelectionEnabled) {
                     return;
                 } else {
                     const grid = this.bufferManager.getGridIdForWinId(winId);
@@ -312,7 +397,7 @@ export class CursorManager
                     const requests: [string, unknown[]][] = [];
                     if (!this.modeManager.isVisualMode && grid) {
                         // need to start visual mode from anchor char
-                        const firstPos = e.selections[0].anchor;
+                        const firstPos = selections[0].anchor;
                         const mouseClickPos = editorPositionToNeovimPosition(textEditor, firstPos);
                         this.logger.debug(
                             `${LOG_PREFIX}: Starting visual mode from: [${mouseClickPos[0]}, ${mouseClickPos[1]}]`,
@@ -324,13 +409,13 @@ export class CursorManager
                         ]);
                         requests.push(["nvim_input", ["v"]]);
                     }
-                    const lastSelection = e.selections.slice(-1)[0];
+                    const lastSelection = selections.slice(-1)[0];
                     if (!lastSelection) {
                         return;
                     }
-                    const cursorPos = editorPositionToNeovimPosition(e.textEditor, lastSelection.active);
+                    const cursorPos = editorPositionToNeovimPosition(textEditor, lastSelection.active);
                     this.logger.debug(
-                        `${LOG_PREFIX}: Updating cursor pos, winId: ${winId}, pos: [${cursorPos[0]}, ${cursorPos[1]}]`,
+                        `${LOG_PREFIX}: Updating cursor pos in neovim, winId: ${winId}, pos: [${cursorPos[0]}, ${cursorPos[1]}]`,
                     );
                     requests.push(["nvim_win_set_cursor", [winId, cursorPos]]);
                     await callAtomic(this.client, requests, this.logger, LOG_PREFIX);
@@ -338,13 +423,13 @@ export class CursorManager
             } else {
                 const cursorPos = getNeovimCursorPosFromEditor(textEditor);
                 this.logger.debug(
-                    `${LOG_PREFIX}: Updating cursor pos, winId: ${winId}, pos: [${cursorPos[0]}, ${cursorPos[1]}]`,
+                    `${LOG_PREFIX}: Updating cursor pos in neovim, winId: ${winId}, pos: [${cursorPos[0]}, ${cursorPos[1]}]`,
                 );
                 const requests: [string, unknown[]][] = [["nvim_win_set_cursor", [winId, cursorPos]]];
                 await callAtomic(this.client, requests, this.logger, LOG_PREFIX);
             }
         },
-        50,
+        20,
         { leading: false, trailing: true },
     );
 
@@ -355,44 +440,89 @@ export class CursorManager
         if (this.ignoreSelectionEvents) {
             return;
         }
-        this.logger.debug(
-            `${LOG_PREFIX}: Updating cursor in editor, viewColumn: ${editor.viewColumn}, pos: [${newLine}, ${newCol}]`,
-        );
+        const editorName = `${editor.document.uri.toString()}, viewColumn: ${editor.viewColumn}`;
+        this.logger.debug(`${LOG_PREFIX}: Updating cursor in editor: ${editorName}, pos: [${newLine}, ${newCol}]`);
         if (editor !== window.activeTextEditor) {
             this.logger.debug(
-                `${LOG_PREFIX}: Editor, viewColumn: ${editor.viewColumn} is not active text editor, skipping cursor setting`,
+                `${LOG_PREFIX}: Editor: ${editorName} is not active text editor, setting cursor directly`,
             );
+            const newPos = new Selection(newLine, newCol, newLine, newCol);
+            if (!editor.selection.isEqual(newPos)) {
+                editor.selections = [newPos];
+            }
             return;
         }
-        const visibleRange = editor.visibleRanges[0];
-        const revealCursor = new Selection(newLine, newCol, newLine, newCol);
-        // if (!this.neovimCursorUpdates.has(editor)) {
-        //     this.neovimCursorUpdates.set(editor, {});
-        // }
-        // this.neovimCursorUpdates.get(editor)![`${newLine}.${newCol}`] = true;
-        editor.selections = [revealCursor];
-        const visibleLines = visibleRange.end.line - visibleRange.start.line;
-        // this.commitScrolling.cancel();
-        if (visibleRange.contains(revealCursor)) {
-            // always try to reveal even if in visible range to reveal horizontal scroll
-            editor.revealRange(new Range(revealCursor.active, revealCursor.active), TextEditorRevealType.Default);
-        } else if (revealCursor.active.line < visibleRange.start.line) {
-            const revealType =
-                visibleRange.start.line - revealCursor.active.line >= visibleLines / 2
-                    ? TextEditorRevealType.Default
-                    : TextEditorRevealType.AtTop;
-            // this.textEditorsRevealing.set(editor, revealCursor.active.line);
-            editor.revealRange(new Range(revealCursor.active, revealCursor.active), revealType);
-            // vscode.commands.executeCommand("revealLine", { lineNumber: revealCursor.active.line, at: revealType });
-        } else if (revealCursor.active.line > visibleRange.end.line) {
-            const revealType =
-                revealCursor.active.line - visibleRange.end.line >= visibleLines / 2
-                    ? TextEditorRevealType.InCenter
-                    : TextEditorRevealType.Default;
-            // this.textEditorsRevealing.set(editor, revealCursor.active.line);
-            editor.revealRange(new Range(revealCursor.active, revealCursor.active), revealType);
-            // vscode.commands.executeCommand("revealLine", { lineNumber: revealCursor.active.line, at: revealType });
+        const currCursor = editor.selection.active;
+        const deltaLine = newLine - currCursor.line;
+        let deltaChar = newCol - currCursor.character;
+        if (Math.abs(deltaLine) <= 1) {
+            this.logger.debug(`${LOG_PREFIX}: Editor: ${editorName} using cursorMove command`);
+            if (Math.abs(deltaLine) > 0) {
+                if (newCol !== currCursor.character) {
+                    deltaChar = newCol;
+                    commands.executeCommand("cursorLineStart");
+                } else {
+                    deltaChar = 0;
+                }
+                commands.executeCommand("cursorMove", {
+                    to: deltaLine > 0 ? "down" : "up",
+                    by: "line",
+                    value: Math.abs(deltaLine),
+                    select: false,
+                });
+            }
+            if (Math.abs(deltaChar) > 0) {
+                if (Math.abs(deltaLine) > 0) {
+                    this.logger.debug(`${LOG_PREFIX}: Editor: ${editorName} Moving cursor by char: ${deltaChar}`);
+                    commands.executeCommand("cursorMove", {
+                        to: deltaChar > 0 ? "right" : "left",
+                        by: "character",
+                        value: Math.abs(deltaChar),
+                        select: false,
+                    });
+                } else {
+                    this.logger.debug(
+                        `${LOG_PREFIX}: Editor: ${editorName} setting cursor directly since zero line delta`,
+                    );
+                    const newPos = new Selection(newLine, newCol, newLine, newCol);
+                    if (!editor.selection.isEqual(newPos)) {
+                        editor.selections = [newPos];
+                        editor.revealRange(newPos, TextEditorRevealType.Default);
+                        commands.executeCommand("editor.action.wordHighlight.trigger");
+                    }
+                }
+            }
+        } else {
+            this.logger.debug(`${LOG_PREFIX}: Editor: ${editorName} setting cursor directly`);
+            const newPos = new Selection(newLine, newCol, newLine, newCol);
+            if (!editor.selection.isEqual(newPos)) {
+                editor.selections = [newPos];
+                const topVisibleLine = Math.min(...editor.visibleRanges.map((r) => r.start.line));
+                const bottomVisibleLine = Math.max(...editor.visibleRanges.map((r) => r.end.line));
+                const type =
+                    deltaLine > 0
+                        ? newLine > bottomVisibleLine + 10
+                            ? TextEditorRevealType.InCenterIfOutsideViewport
+                            : TextEditorRevealType.Default
+                        : deltaLine < 0
+                        ? newLine < topVisibleLine - 10
+                            ? TextEditorRevealType.InCenterIfOutsideViewport
+                            : TextEditorRevealType.Default
+                        : TextEditorRevealType.Default;
+                editor.revealRange(newPos, type);
+                commands.executeCommand("editor.action.wordHighlight.trigger");
+            }
         }
+    };
+
+    private getDebouncedUpdateCursorPos = (editor: TextEditor): CursorManager["updateCursorPosInEditor"] => {
+        const existing = this.debouncedCursorUpdates.get(editor);
+        if (existing) {
+            return existing;
+        }
+        const func = debounce(this.updateCursorPosInEditor, 10, { leading: false, trailing: true, maxWait: 100 });
+        this.debouncedCursorUpdates.set(editor, func);
+        return func;
     };
 
     private updateCursorStyle(modeName: string): void {
@@ -446,6 +576,15 @@ export class CursorManager
         }
         window.activeTextEditor.selections = newSelections;
     }
+
+    private onModeChange = (newMode: string): void => {
+        if (newMode === "normal" && window.activeTextEditor && window.activeTextEditor.selections.length > 1) {
+            window.activeTextEditor.selections = [
+                new Selection(window.activeTextEditor.selection.active, window.activeTextEditor.selection.active),
+            ];
+        }
+    };
+
     // Following lines are enabling vim-style cursor follow on scroll
     // although it's working, unfortunately it breaks vscode jumplist when scrolling to definition from outline/etc
     // I think it's better ot have more-less usable jumplist than such minor feature at this feature request will be implemented (https://github.com/microsoft/vscode/issues/84351)

@@ -26,7 +26,6 @@ endfunction
 
 function! s:vscodeGoToDefinition(str)
     if exists('b:vscode_controlled') && b:vscode_controlled
-        exe "normal! m'"
         call VSCodeNotify('editor.action.reveal' . a:str)
     else
         " Allow to funcionar in help files
@@ -93,10 +92,6 @@ xnoremap <C-w>gd <Cmd>call VSCodeNotify('editor.action.revealDefinitionAside')<C
 " Bind C-/ to vscode commentary since calling from vscode produces double comments due to multiple cursors
 xnoremap <expr> <C-/> <SID>vscodeCommentary()
 nnoremap <expr> <C-/> <SID>vscodeCommentary() . '_'
-
-" Workaround for gk/gj
-nnoremap gk <Cmd>call VSCodeCall('cursorMove', { 'to': 'up', 'by': 'wrappedLine', 'value': v:count ? v:count : 1 })<CR>
-nnoremap gj <Cmd>call VSCodeCall('cursorMove', { 'to': 'down', 'by': 'wrappedLine', 'value': v:count ? v:count : 1 })<CR>
 
 " workaround for calling command picker in visual mode
 xnoremap <C-P> <Cmd>call <SID>openVSCodeCommandsInVisualMode()<CR>

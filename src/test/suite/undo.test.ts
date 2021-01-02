@@ -79,6 +79,58 @@ describe("Undo", () => {
         );
     });
 
+    it("Undo points are correct after newlines", async () => {
+        const doc = await vscode.workspace.openTextDocument({
+            content: "some line\notherline",
+        });
+        await vscode.window.showTextDocument(doc, vscode.ViewColumn.One);
+        await wait();
+        await sendVSCodeKeys("jo");
+        await sendVSCodeKeys("blah\nblah");
+        await sendEscapeKey();
+
+        await assertContent(
+            {
+                content: ["some line", "otherline", "blah", "blah"],
+            },
+            client,
+        );
+
+        await sendVSCodeKeys("u");
+        await assertContent(
+            {
+                content: ["some line", "otherline"],
+            },
+            client,
+        );
+    });
+
+    it("Undo points are correct after newlines - 2", async () => {
+        const doc = await vscode.workspace.openTextDocument({
+            content: "",
+        });
+        await vscode.window.showTextDocument(doc, vscode.ViewColumn.One);
+        await wait();
+        await sendVSCodeKeys("i");
+        await sendVSCodeKeys("blah\notherblah");
+        await sendEscapeKey();
+
+        await assertContent(
+            {
+                content: ["blah", "otherblah"],
+            },
+            client,
+        );
+
+        await sendVSCodeKeys("u");
+        await assertContent(
+            {
+                content: [""],
+            },
+            client,
+        );
+    });
+
     it("Buffer is ok after undo and o", async () => {
         const doc = await vscode.workspace.openTextDocument({
             content: "a\nb",
@@ -139,5 +191,28 @@ describe("Undo", () => {
             },
             client,
         );
+    });
+
+    it("Undo after switching tabs", async () => {
+        const doc1 = await vscode.workspace.openTextDocument({
+            content: ["1"].join("\n"),
+        });
+        const doc2 = await vscode.workspace.openTextDocument({
+            content: ["2"].join("\n"),
+        });
+        await vscode.window.showTextDocument(doc1, vscode.ViewColumn.One);
+        await wait(1000);
+        await vscode.window.showTextDocument(doc2, vscode.ViewColumn.One);
+        await wait(1000);
+        await assertContent({ content: ["2"] }, client);
+        await sendVSCodeKeys("A");
+        await sendVSCodeKeys("test");
+        await sendEscapeKey();
+        await assertContent({ content: ["2test"] }, client);
+        await sendVSCodeKeys("gT");
+        await sendVSCodeKeys("gt");
+        await wait(1000);
+        await sendVSCodeKeys("u");
+        await assertContent({ content: ["2"] }, client);
     });
 });
